@@ -1,9 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { Innertube } from 'youtubei.js';
+import { Innertube, UniversalCache } from 'youtubei.js';
 import { Ytdl } from '@distube/ytdl-core';
-import { spawn } from 'child_process';
 import { Readable } from 'node:stream';
 dotenv.config();
 const app = express();
@@ -19,18 +18,19 @@ const streamCache = new Map();
 let likedSongs = [];
 let recentlyPlayed = [];
 let playlists = [];
+// Pure JavaScript YouTube Client Singleton
 let yt = null;
-(async () => {
-    try {
-        yt = await Innertube.create();
-        console.log('⚡ Fast Search & Audio Engine ready');
+async function getYouTube() {
+    if (!yt) {
+        yt = await Innertube.create({
+            cache: new UniversalCache(false),
+            generate_session_locally: true,
+        });
+        console.log('⚡ Fast Pure JS YouTube Engine ready');
     }
-    catch (err) {
-        console.error('Innertube search init error:', err);
-    }
-})();
-// Resilient @distube/ytdl-core client configuration using multi-client InnerTube fallback
-// (visionos, web_embedded, tv, mweb bypass YouTube data-center bot detection blocks)
+    return yt;
+}
+// Pure JS in-memory fallback using @distube/ytdl-core (zero binary dependencies)
 const ytdl = new Ytdl({
     clients: ['visionos', 'web_embedded', 'tv', 'mweb'],
 });
@@ -135,7 +135,7 @@ app.get('/api/suggestions', async (req, res) => {
     catch { }
     return res.json({ suggestions: [] });
 });
-// 2. Search Tracks (Robust YouTube fallback guaranteed)
+// 2. Search Tracks (Pure JS YouTube fallback guaranteed)
 app.get('/api/search', async (req, res) => {
     const rawQuery = (req.query.q || '').trim();
     if (!rawQuery)
@@ -168,13 +168,11 @@ app.get('/api/search', async (req, res) => {
             console.warn('[SEARCH] Spotify error:', err.message);
         }
     }
-    // YouTube Music search fallback (handles all songs, regional tracks & indie)
+    // Pure JavaScript YouTube Music search fallback (handles all songs, regional tracks & indie)
     if (tracks.length === 0) {
         try {
-            if (!yt) {
-                yt = await Innertube.create();
-            }
-            const musicSearch = await yt.music.search(cleanQuery, { type: 'song' });
+            const youtube = await getYouTube();
+            const musicSearch = await youtube.music.search(cleanQuery, { type: 'song' });
             let songItems = [];
             // Unpack actual songs from shelf instead of using the shelf container
             if (musicSearch.songs?.contents?.length) {
@@ -209,7 +207,7 @@ app.get('/api/search', async (req, res) => {
             }
             // Fallback to general YouTube video search if Music search returned no tracks
             if (tracks.length === 0) {
-                const generalSearch = await yt.search(`${cleanQuery} song`, { type: 'video' });
+                const generalSearch = await youtube.search(`${cleanQuery} song`, { type: 'video' });
                 const videos = (generalSearch.videos || []).filter((v) => v && v.id);
                 tracks = videos.map((v) => ({
                     id: String(v.id),
@@ -230,127 +228,139 @@ app.get('/api/search', async (req, res) => {
     console.log(`[SEARCH] Query: "${cleanQuery}" | Results found: ${tracks.length}`);
     return res.json({ count: tracks.length, results: tracks });
 });
-// Secondary fallback: yt-dlp if installed on host
-function resolveWithYtDlp(videoId) {
-    return new Promise((resolve, reject) => {
-        const proc = spawn('yt-dlp', [
-            '-g',
-            '-f', '140/ba',
-            '--no-playlist',
-            '--skip-download',
-            '--no-warnings',
-            '--no-check-certificates',
-            `https://www.youtube.com/watch?v=${videoId}`,
-        ]);
-        let output = '';
-        let errOutput = '';
-        proc.stdout.on('data', (d) => { output += d.toString(); });
-        proc.stderr.on('data', (d) => { errOutput += d.toString(); });
-        proc.on('close', (code) => {
-            const streamUrl = output.trim().split('\n')[0];
-            if (code === 0 && streamUrl) {
-                resolve(streamUrl);
-            }
-            else {
-                reject(new Error(errOutput || `yt-dlp exit code ${code}`));
-            }
-        });
-        proc.on('error', (err) => reject(err));
-    });
-}
-// Resilient Audio URL resolver:
-// 1. @distube/ytdl-core using InnerTube client emulation (visionos, web_embedded, tv, mweb)
-// 2. yt-dlp binary as secondary host fallback
+// Resilient Pure JavaScript Audio URL Resolver (Zero external binaries)
+// 1. Innertube IOS client emulation (unciphered direct CDN URL)
+// 2. Innertube standard info decipher
+// 3. @distube/ytdl-core in-memory pure JS solver
 async function resolveDirectAudioUrl(videoId) {
     const cached = streamCache.get(videoId);
     if (cached && Date.now() < cached.expiresAt) {
         return cached.url;
     }
-    // 1. Primary: @distube/ytdl-core with resilient InnerTube clients
+    const youtube = await getYouTube();
+    // Attempt 1: Innertube iOS client context (returns direct unciphered CDN audio URL without bot detection)
+    try {
+        const info = await youtube.getBasicInfo(videoId, { client: 'IOS' });
+        const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+        if (format?.url) {
+            streamCache.set(videoId, {
+                url: format.url,
+                expiresAt: Date.now() + 3 * 60 * 60 * 1000,
+            });
+            return format.url;
+        }
+    }
+    catch (iosErr) {
+        console.warn(`[STREAM] IOS client attempt for ${videoId}:`, iosErr?.message || iosErr);
+    }
+    // Attempt 2: Innertube standard getInfo & decipher
+    try {
+        const info = await youtube.getInfo(videoId);
+        const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+        if (format?.url) {
+            streamCache.set(videoId, {
+                url: format.url,
+                expiresAt: Date.now() + 3 * 60 * 60 * 1000,
+            });
+            return format.url;
+        }
+        if (format) {
+            const deciphered = await format.decipher(youtube.session.player);
+            if (deciphered) {
+                streamCache.set(videoId, {
+                    url: deciphered,
+                    expiresAt: Date.now() + 3 * 60 * 60 * 1000,
+                });
+                return deciphered;
+            }
+        }
+    }
+    catch (decErr) {
+        console.warn(`[STREAM] Standard decipher attempt for ${videoId}:`, decErr?.message || decErr);
+    }
+    // Attempt 3: Pure JS in-memory solver via @distube/ytdl-core (no external binaries)
     try {
         const info = await ytdl.getInfo(videoId);
-        const audioFormats = info.formats
-            .filter((f) => f.hasAudio && !f.hasVideo && f.url)
-            .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-        if (audioFormats.length > 0 && audioFormats[0]?.url) {
-            const directUrl = audioFormats[0].url;
+        const format = info.formats.find((f) => f.hasAudio && !f.hasVideo && f.url);
+        if (format?.url) {
             streamCache.set(videoId, {
-                url: directUrl,
+                url: format.url,
                 expiresAt: Date.now() + 3 * 60 * 60 * 1000,
             });
-            return directUrl;
+            return format.url;
         }
     }
-    catch (err) {
-        console.warn(`[STREAM] @distube/ytdl-core extraction attempt failed for ${videoId}:`, err?.message || err);
+    catch (ytdlErr) {
+        console.warn(`[STREAM] ytdl-core in-memory attempt for ${videoId}:`, ytdlErr?.message || ytdlErr);
     }
-    // 2. Secondary fallback: yt-dlp if installed on host
-    try {
-        const directUrl = await resolveWithYtDlp(videoId);
-        if (directUrl) {
-            streamCache.set(videoId, {
-                url: directUrl,
-                expiresAt: Date.now() + 3 * 60 * 60 * 1000,
-            });
-            return directUrl;
-        }
-    }
-    catch (dlpErr) {
-        console.warn(`[STREAM] yt-dlp fallback failed for ${videoId}:`, dlpErr?.message || dlpErr);
-    }
-    throw new Error(`Could not extract playable audio stream for video ID: ${videoId}`);
+    throw new Error(`Unable to resolve playable audio URL for videoId: ${videoId}`);
 }
-// 3. Audio Streaming Pipe Endpoint
-// Pipes deciphered audio bytes with HTTP 206 Partial Content Range support
+// 3. Audio Streaming Pipe / Redirect Endpoint
 app.get('/api/stream', async (req, res) => {
     const videoId = (req.query.id || req.query.videoId || '').trim();
     if (!videoId) {
         return res.status(400).json({ error: 'Video ID required (?id=<videoId> or ?videoId=<videoId>)' });
     }
     try {
-        const directUrl = await resolveDirectAudioUrl(videoId);
-        // If client explicitly requested a 302 redirect
+        // If redirect requested
         if (req.query.redirect === 'true') {
-            return res.redirect(directUrl);
+            const streamUrl = await resolveDirectAudioUrl(videoId);
+            return res.redirect(302, streamUrl);
         }
-        // Proxy stream with Range request handling
-        const rangeHeader = req.headers.range;
-        const fetchHeaders = {};
-        if (rangeHeader) {
-            fetchHeaders['Range'] = rangeHeader;
+        // Try resolving direct URL and piping with Range headers
+        let streamUrl;
+        try {
+            streamUrl = await resolveDirectAudioUrl(videoId);
         }
-        const upstreamRes = await fetch(directUrl, { headers: fetchHeaders });
-        if (!upstreamRes.ok && upstreamRes.status !== 206) {
-            // Fallback: redirect if upstream proxy request rejected
-            return res.redirect(directUrl);
+        catch (urlErr) {
+            console.warn(`[STREAM] Direct URL resolution failed for pipe ${videoId}:`, urlErr);
         }
-        res.status(upstreamRes.status);
-        const contentType = upstreamRes.headers.get('content-type') || 'audio/mp4';
-        const contentLength = upstreamRes.headers.get('content-length');
-        const contentRange = upstreamRes.headers.get('content-range');
-        const acceptRanges = upstreamRes.headers.get('accept-ranges') || 'bytes';
-        res.setHeader('Content-Type', contentType);
-        res.setHeader('Accept-Ranges', acceptRanges);
-        if (contentLength)
-            res.setHeader('Content-Length', contentLength);
-        if (contentRange)
-            res.setHeader('Content-Range', contentRange);
-        if (upstreamRes.body) {
-            const nodeStream = Readable.fromWeb(upstreamRes.body);
-            nodeStream.pipe(res);
-            nodeStream.on('error', (pipeErr) => {
-                console.error('[STREAM ERROR] Pipe streaming error:', pipeErr);
-            });
+        if (streamUrl) {
+            const rangeHeader = req.headers.range;
+            const fetchHeaders = {};
+            if (rangeHeader) {
+                fetchHeaders['Range'] = rangeHeader;
+            }
+            const upstreamRes = await fetch(streamUrl, { headers: fetchHeaders });
+            if (upstreamRes.ok || upstreamRes.status === 206) {
+                res.status(upstreamRes.status);
+                const contentType = upstreamRes.headers.get('content-type') || 'audio/mp4';
+                const contentLength = upstreamRes.headers.get('content-length');
+                const contentRange = upstreamRes.headers.get('content-range');
+                const acceptRanges = upstreamRes.headers.get('accept-ranges') || 'bytes';
+                res.setHeader('Content-Type', contentType);
+                res.setHeader('Accept-Ranges', acceptRanges);
+                if (contentLength)
+                    res.setHeader('Content-Length', contentLength);
+                if (contentRange)
+                    res.setHeader('Content-Range', contentRange);
+                if (upstreamRes.body) {
+                    const nodeStream = Readable.fromWeb(upstreamRes.body);
+                    nodeStream.pipe(res);
+                    nodeStream.on('error', (pipeErr) => {
+                        console.error('[STREAM FATAL ERROR]: Pipe streaming error:', pipeErr);
+                    });
+                    return;
+                }
+            }
+            // If range request pipe failed, redirect directly to YouTube CDN
+            return res.redirect(302, streamUrl);
         }
-        else {
-            res.end();
-        }
+        // Fallback: pipe directly via youtube.download
+        const youtube = await getYouTube();
+        const downloadStream = await youtube.download(videoId, { type: 'audio', quality: 'best' });
+        res.setHeader('Content-Type', 'audio/webm');
+        const nodeStream = Readable.fromWeb(downloadStream);
+        nodeStream.pipe(res);
+        nodeStream.on('error', (err) => {
+            console.error('[STREAM FATAL ERROR]: youtube.download pipe error:', err);
+        });
     }
     catch (err) {
-        console.error('[STREAM ERROR]', err);
+        console.error('[STREAM FATAL ERROR]:', err);
         return res.status(500).json({
             error: 'Stream failed',
-            message: err?.message || 'Unknown stream error',
+            message: err?.message || 'Unknown stream fatal error',
         });
     }
 });
@@ -363,54 +373,59 @@ app.get('/api/resolve', async (req, res) => {
     try {
         const query = `${title} ${artist} audio`;
         let videoId;
-        if (yt) {
-            try {
-                const musicSearch = await yt.music.search(query, { type: 'song' });
-                if (musicSearch.songs?.contents?.[0]?.id) {
-                    videoId = musicSearch.songs.contents[0].id;
-                }
-                else if (Array.isArray(musicSearch.contents)) {
-                    for (const item of musicSearch.contents) {
-                        if (item.contents?.[0]?.id) {
-                            videoId = item.contents[0].id;
-                            break;
-                        }
-                        else if (item.items?.[0]?.id) {
-                            videoId = item.items[0].id;
-                            break;
-                        }
-                        else if (item.id && item.type !== 'MusicShelf') {
-                            videoId = item.id;
-                            break;
-                        }
+        const youtube = await getYouTube();
+        try {
+            const musicSearch = await youtube.music.search(query, { type: 'song' });
+            if (musicSearch.songs?.contents?.[0]?.id) {
+                videoId = musicSearch.songs.contents[0].id;
+            }
+            else if (Array.isArray(musicSearch.contents)) {
+                for (const item of musicSearch.contents) {
+                    if (item.contents?.[0]?.id) {
+                        videoId = item.contents[0].id;
+                        break;
+                    }
+                    else if (item.items?.[0]?.id) {
+                        videoId = item.items[0].id;
+                        break;
+                    }
+                    else if (item.id && item.type !== 'MusicShelf') {
+                        videoId = item.id;
+                        break;
                     }
                 }
             }
-            catch (searchErr) {
-                console.warn('[RESOLVE] YouTube Music search warning:', searchErr?.message || searchErr);
+        }
+        catch (searchErr) {
+            console.warn('[RESOLVE] YouTube Music search warning:', searchErr?.message || searchErr);
+        }
+        if (!videoId) {
+            try {
+                const generalSearch = await youtube.search(query, { type: 'video' });
+                videoId = generalSearch.videos?.[0]?.id;
             }
-            if (!videoId) {
-                try {
-                    const generalSearch = await yt.search(query, { type: 'video' });
-                    videoId = generalSearch.videos?.[0]?.id;
-                }
-                catch (generalErr) {
-                    console.warn('[RESOLVE] YouTube video search warning:', generalErr?.message || generalErr);
-                }
+            catch (generalErr) {
+                console.warn('[RESOLVE] YouTube video search warning:', generalErr?.message || generalErr);
             }
         }
         if (!videoId)
             return res.status(404).json({ error: 'Track not found' });
-        const directUrl = await resolveDirectAudioUrl(videoId);
+        let directUrl;
+        try {
+            directUrl = await resolveDirectAudioUrl(videoId);
+        }
+        catch (resolveErr) {
+            console.warn(`[RESOLVE] Direct audio URL resolution warning for ${videoId}:`, resolveErr);
+        }
         return res.json({
-            streamUrl: directUrl,
+            streamUrl: directUrl || `/api/stream?id=${videoId}`,
             proxyStreamUrl: `/api/stream?id=${videoId}`,
-            directUrl,
+            directUrl: directUrl || null,
             videoId,
         });
     }
     catch (err) {
-        console.error('[STREAM ERROR]', err);
+        console.error('[STREAM FATAL ERROR]:', err);
         return res.status(500).json({
             error: 'Resolve failed',
             message: err?.message || 'Unknown resolve error',
@@ -490,13 +505,11 @@ app.get('/api/recommendations', async (req, res) => {
     // Attempt 2: YouTube Music recommendations based on listening history or trending hits
     if (tracks.length === 0) {
         try {
-            if (!yt) {
-                yt = await Innertube.create();
-            }
+            const youtube = await getYouTube();
             // Pick seed query based on recent history or fallback to top hits
             const lastTrack = recentlyPlayed[0] || likedSongs[0];
             const seedQuery = lastTrack?.artist ? `${lastTrack.artist} top songs` : 'top hits';
-            const musicSearch = await yt.music.search(seedQuery, { type: 'song' });
+            const musicSearch = await youtube.music.search(seedQuery, { type: 'song' });
             let songItems = [];
             if (musicSearch.songs?.contents?.length) {
                 songItems = musicSearch.songs.contents;
@@ -543,7 +556,7 @@ app.get('/api/recommendations', async (req, res) => {
                 source: 'curated',
             },
             {
-                id: '7wfGh8n714w',
+                id: 'J7p4bzqLvCw',
                 title: 'Blinding Lights',
                 artist: 'The Weeknd',
                 movieOrAlbum: 'After Hours',
@@ -553,7 +566,7 @@ app.get('/api/recommendations', async (req, res) => {
                 source: 'curated',
             },
             {
-                id: '0VwhorTQe50',
+                id: 'OsfAnsMY21M',
                 title: 'Levitating',
                 artist: 'Dua Lipa',
                 movieOrAlbum: 'Future Nostalgia',
@@ -563,7 +576,7 @@ app.get('/api/recommendations', async (req, res) => {
                 source: 'curated',
             },
             {
-                id: 'gNi_6U5Pm_o',
+                id: 'nujn6wbr-e8',
                 title: 'As It Was',
                 artist: 'Harry Styles',
                 movieOrAlbum: "Harry's House",
