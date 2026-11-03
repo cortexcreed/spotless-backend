@@ -3,7 +3,9 @@ import type { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { Innertube } from 'youtubei.js';
+import { Ytdl } from '@distube/ytdl-core';
 import { spawn } from 'child_process';
+import { Readable } from 'node:stream';
 
 dotenv.config();
 
@@ -47,11 +49,17 @@ let yt: Innertube | null = null;
 (async () => {
   try {
     yt = await Innertube.create();
-    console.log('? Fast Search & Audio Engine ready');
+    console.log('⚡ Fast Search & Audio Engine ready');
   } catch (err) {
     console.error('Innertube search init error:', err);
   }
 })();
+
+// Resilient @distube/ytdl-core client configuration using multi-client InnerTube fallback
+// (visionos, web_embedded, tv, mweb bypass YouTube data-center bot detection blocks)
+const ytdl = new Ytdl({
+  clients: ['visionos', 'web_embedded', 'tv', 'mweb'],
+});
 
 // Sanitization Helpers to guarantee primitive strings are returned
 function cleanTitle(val: any, fallback = 'Unknown'): string {
@@ -243,14 +251,9 @@ app.get('/api/search', async (req: Request, res: Response) => {
   return res.json({ count: tracks.length, results: tracks });
 });
 
-// 3. Fast Audio Link Resolution using yt-dlp
-function resolveDirectCdn(videoId: string): Promise<string> {
+// Secondary fallback: yt-dlp if installed on host
+function resolveWithYtDlp(videoId: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const cached = streamCache.get(videoId);
-    if (cached && Date.now() < cached.expiresAt) {
-      return resolve(cached.url);
-    }
-
     const proc = spawn('yt-dlp', [
       '-g',
       '-f', '140/ba',
@@ -270,13 +273,9 @@ function resolveDirectCdn(videoId: string): Promise<string> {
     proc.on('close', (code) => {
       const streamUrl = output.trim().split('\n')[0];
       if (code === 0 && streamUrl) {
-        streamCache.set(videoId, {
-          url: streamUrl,
-          expiresAt: Date.now() + 4 * 60 * 60 * 1000,
-        });
         resolve(streamUrl);
       } else {
-        reject(new Error(errOutput || `Code ${code}`));
+        reject(new Error(errOutput || `yt-dlp exit code ${code}`));
       }
     });
 
@@ -284,10 +283,114 @@ function resolveDirectCdn(videoId: string): Promise<string> {
   });
 }
 
+// Resilient Audio URL resolver:
+// 1. @distube/ytdl-core using InnerTube client emulation (visionos, web_embedded, tv, mweb)
+// 2. yt-dlp binary as secondary host fallback
+async function resolveDirectAudioUrl(videoId: string): Promise<string> {
+  const cached = streamCache.get(videoId);
+  if (cached && Date.now() < cached.expiresAt) {
+    return cached.url;
+  }
+
+  // 1. Primary: @distube/ytdl-core with resilient InnerTube clients
+  try {
+    const info = await ytdl.getInfo(videoId);
+    const audioFormats = info.formats
+      .filter((f) => f.hasAudio && !f.hasVideo && f.url)
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+    if (audioFormats.length > 0 && audioFormats[0]?.url) {
+      const directUrl = audioFormats[0].url;
+      streamCache.set(videoId, {
+        url: directUrl,
+        expiresAt: Date.now() + 3 * 60 * 60 * 1000,
+      });
+      return directUrl;
+    }
+  } catch (err: any) {
+    console.warn(`[STREAM] @distube/ytdl-core extraction attempt failed for ${videoId}:`, err?.message || err);
+  }
+
+  // 2. Secondary fallback: yt-dlp if installed on host
+  try {
+    const directUrl = await resolveWithYtDlp(videoId);
+    if (directUrl) {
+      streamCache.set(videoId, {
+        url: directUrl,
+        expiresAt: Date.now() + 3 * 60 * 60 * 1000,
+      });
+      return directUrl;
+    }
+  } catch (dlpErr: any) {
+    console.warn(`[STREAM] yt-dlp fallback failed for ${videoId}:`, dlpErr?.message || dlpErr);
+  }
+
+  throw new Error(`Could not extract playable audio stream for video ID: ${videoId}`);
+}
+
+// 3. Audio Streaming Pipe Endpoint
+// Pipes deciphered audio bytes with HTTP 206 Partial Content Range support
+app.get('/api/stream', async (req: Request, res: Response) => {
+  const videoId = ((req.query.id as string) || (req.query.videoId as string) || '').trim();
+  if (!videoId) {
+    return res.status(400).json({ error: 'Video ID required (?id=<videoId> or ?videoId=<videoId>)' });
+  }
+
+  try {
+    const directUrl = await resolveDirectAudioUrl(videoId);
+
+    // If client explicitly requested a 302 redirect
+    if (req.query.redirect === 'true') {
+      return res.redirect(directUrl);
+    }
+
+    // Proxy stream with Range request handling
+    const rangeHeader = req.headers.range;
+    const fetchHeaders: Record<string, string> = {};
+    if (rangeHeader) {
+      fetchHeaders['Range'] = rangeHeader;
+    }
+
+    const upstreamRes = await fetch(directUrl, { headers: fetchHeaders });
+
+    if (!upstreamRes.ok && upstreamRes.status !== 206) {
+      // Fallback: redirect if upstream proxy request rejected
+      return res.redirect(directUrl);
+    }
+
+    res.status(upstreamRes.status);
+    const contentType = upstreamRes.headers.get('content-type') || 'audio/mp4';
+    const contentLength = upstreamRes.headers.get('content-length');
+    const contentRange = upstreamRes.headers.get('content-range');
+    const acceptRanges = upstreamRes.headers.get('accept-ranges') || 'bytes';
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', acceptRanges);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+
+    if (upstreamRes.body) {
+      const nodeStream = Readable.fromWeb(upstreamRes.body as any);
+      nodeStream.pipe(res);
+      nodeStream.on('error', (pipeErr) => {
+        console.error('[STREAM ERROR] Pipe streaming error:', pipeErr);
+      });
+    } else {
+      res.end();
+    }
+  } catch (err: any) {
+    console.error('[STREAM ERROR]', err);
+    return res.status(500).json({
+      error: 'Stream failed',
+      message: err?.message || 'Unknown stream error',
+    });
+  }
+});
+
 // 4. Track Stream URL Resolver
 app.get('/api/resolve', async (req: Request, res: Response) => {
-  const title = (req.query.title as string || '').trim();
-  const artist = (req.query.artist as string || '').trim();
+  const title = ((req.query.title as string) || '').trim();
+  const artist = ((req.query.artist as string) || '').trim();
 
   if (!title) return res.status(400).json({ error: 'Title required' });
 
@@ -314,20 +417,35 @@ app.get('/api/resolve', async (req: Request, res: Response) => {
             }
           }
         }
-      } catch {}
+      } catch (searchErr: any) {
+        console.warn('[RESOLVE] YouTube Music search warning:', searchErr?.message || searchErr);
+      }
 
       if (!videoId) {
-        const generalSearch: any = await yt.search(query, { type: 'video' });
-        videoId = generalSearch.videos?.[0]?.id;
+        try {
+          const generalSearch: any = await yt.search(query, { type: 'video' });
+          videoId = generalSearch.videos?.[0]?.id;
+        } catch (generalErr: any) {
+          console.warn('[RESOLVE] YouTube video search warning:', generalErr?.message || generalErr);
+        }
       }
     }
 
     if (!videoId) return res.status(404).json({ error: 'Track not found' });
 
-    const directUrl = await resolveDirectCdn(videoId);
-    return res.json({ streamUrl: directUrl, videoId });
+    const directUrl = await resolveDirectAudioUrl(videoId);
+    return res.json({
+      streamUrl: directUrl,
+      proxyStreamUrl: `/api/stream?id=${videoId}`,
+      directUrl,
+      videoId,
+    });
   } catch (err: any) {
-    return res.status(500).json({ error: 'Resolve failed' });
+    console.error('[STREAM ERROR]', err);
+    return res.status(500).json({
+      error: 'Resolve failed',
+      message: err?.message || 'Unknown resolve error',
+    });
   }
 });
 
